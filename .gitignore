@@ -1,0 +1,12 @@
+.DS_Store
+.idea
+*.log
+tmp/
+
+build/
+example.txt
+measurements.txt
+main
+first
+test
+*.dSYM/
