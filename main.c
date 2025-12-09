@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define ENABLE_DEBUG_PRINTS 0
@@ -23,8 +24,11 @@
 #define ALPHABET_CAPITAL_DRIFT 32
 #define NUMBER_OF_PARTITIONS (ALPHABET_SIZE + 1)
 
+#define MAX_BUFFER_SIZE 1024
+#define DEFAULT_CHUNK_SIZE 200 * 1024 * 1024
+
 typedef struct Node {
-    char buffer[1000];
+    void *buffer_start;
     struct Node *next;
 } Node;
 typedef struct Queue {
@@ -59,8 +63,10 @@ HashTable *tables[NUMBER_OF_PARTITIONS];
 typedef struct reader_thread_data {
     int thread_id;
     FILE *file;
+    size_t file_size;
     int *file_read_count;
     int *finished_reader_threads;
+    int *file_mmap_offset;
 } reader_thread_data;
 
 typedef struct writer_thread_data {
@@ -72,6 +78,7 @@ typedef struct writer_thread_data {
 
 pthread_mutex_t file_semaphore = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t read_queue_exit_count_semaphore = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t file_mmap_offset_semaphore = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t table_semaphores[NUMBER_OF_PARTITIONS];
 pthread_mutex_t file_queue_semaphores[NUMBER_OF_PARTITIONS];
 
@@ -141,9 +148,9 @@ char *get_semaphore_name(int semaphore_type) {
     }
 }
 
-void enqueue(Queue *q, char *data) {
+void enqueue(Queue *q, void *buffer_start) {
     Node *newNode = (Node *)malloc(sizeof(Node));
-    strncpy(newNode->buffer, data, sizeof(newNode->buffer));
+    newNode->buffer_start = buffer_start;
     newNode->next = NULL;
     if (q->rear == NULL) {
         q->front = q->rear = newNode;
@@ -152,18 +159,17 @@ void enqueue(Queue *q, char *data) {
         q->rear = newNode;
     }
 }
-bool dequeue(Queue *q, char buffer[1000]) {
+void *dequeue(Queue *q) {
     if (q->front == NULL) {
         return false;
     }
     Node *temp = q->front;
-    strncpy(buffer, temp->buffer, sizeof(temp->buffer));
 
     q->front = q->front->next;
     if (q->front == NULL)
         q->rear = NULL;
 
-    return true;
+    return temp->buffer_start;
 }
 
 static inline uint32_t murmur_32_scramble(uint32_t k) {
@@ -286,6 +292,13 @@ void message(const char *message, int thread_type, int thread_id,
     printf("%s\n", message);
 }
 
+size_t get_file_size(FILE *file) {
+    fseek(file, 0, SEEK_END);
+    size_t size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    return size;
+}
+
 void *process_file_data(void *threadarg) {
     reader_thread_data *my_data = (reader_thread_data *)threadarg;
 
@@ -293,58 +306,46 @@ void *process_file_data(void *threadarg) {
         char buffer[1024];
 
         pthread_mutex_lock(&file_semaphore);
+        pthread_mutex_lock(&file_mmap_offset_semaphore);
 
-        /* printf("[FileReaderThread %d] Acquired file semaphore.\n", */
-        /*        my_data->thread_id); */
+        size_t bytes_to_map = DEFAULT_CHUNK_SIZE;
 
-        char *res = fgets(buffer, sizeof(buffer), my_data->file);
-        if (res == NULL) {
+        size_t offset = *(my_data->file_mmap_offset);
+        if (offset >= my_data->file_size) {
+
+            pthread_mutex_unlock(&file_mmap_offset_semaphore);
+            pthread_mutex_unlock(&file_semaphore);
 
             pthread_mutex_lock(&read_queue_exit_count_semaphore);
             *my_data->finished_reader_threads += 1;
             pthread_mutex_unlock(&read_queue_exit_count_semaphore);
 
-            pthread_mutex_unlock(&file_semaphore);
-            /* printf("[FileReaderThread %d] Reached end of file. Exiting.\n",
-             */
-            /*        my_data->thread_id); */
-
             pthread_exit(NULL);
         }
 
+        if (offset + bytes_to_map > my_data->file_size) {
+            bytes_to_map = my_data->file_size - offset;
+        }
+        void *file_memory = mmap(NULL, bytes_to_map, PROT_READ, MAP_PRIVATE,
+                                 fileno(my_data->file), offset);
+
+        if (file_memory == MAP_FAILED) {
+            perror("mmap failed, killing process");
+            exit(EXIT_FAILURE);
+        }
+
         *my_data->file_read_count += 1;
+        *(my_data->file_mmap_offset) += DEFAULT_CHUNK_SIZE;
 
-        /* printf("[FileReaderThread %d] Read file times: %d.\n", */
-        /*        my_data->thread_id, *my_data->file_read_count); */
-
-        /* printf("[FileReaderThread %d] Releasimg file semaphore.\n", */
-        /*        my_data->thread_id); */
-
+        pthread_mutex_lock(&file_mmap_offset_semaphore);
         pthread_mutex_unlock(&file_semaphore);
 
         int queue_index = index_by_alphabet(buffer[0]);
 
         pthread_mutex_lock(&file_queue_semaphores[queue_index]);
-
-        /* printf("[FileReaderThread %d] Acquired write queue semaphore for " */
-        /*        "queue %d.\n", */
-        /*        my_data->thread_id, queue_index); */
-
         enqueue(file_queues[queue_index], buffer);
-
-        /* printf("[FileReaderThread %d] Enqueued data to queue %d.\n", */
-        /*        my_data->thread_id, queue_index); */
-
         pthread_mutex_unlock(&file_queue_semaphores[queue_index]);
-
-        /* printf("[FileReaderThread %d] Released write queue semaphore for " */
-        /*        "queue %d.\n", */
-        /*        my_data->thread_id, queue_index); */
     }
-
-    /* printf("[FileReaderThread %d] Exiting through the end\n", */
-    /*        my_data->thread_id); */
-
     pthread_exit(NULL);
 }
 
@@ -353,91 +354,50 @@ void *insert_data_into_table(void *arg) {
     writer_thread_data *my_data = (writer_thread_data *)arg;
 
     for (;;) {
-        char buffer[1024]; // READ FROM QUEUE
+        char buffer[1024];
 
         pthread_mutex_lock(
             &file_queue_semaphores[index_by_alphabet(my_data->queue_letter)]);
 
-        /* printf("[TableWriterThread %d] Acquired read queue semaphore for " */
-        /*        "queue %d - letter %c.\n", */
-        /*        my_data->thread_id, index_by_alphabet(my_data->queue_letter),
-         */
-        /*        my_data->queue_letter); */
+        void *buffer_start =
+            dequeue(file_queues[index_by_alphabet(my_data->queue_letter)]);
+        pthread_mutex_unlock(
+            &file_queue_semaphores[index_by_alphabet(my_data->queue_letter)]);
 
-        if (dequeue(file_queues[index_by_alphabet(my_data->queue_letter)],
-                    buffer) == false) {
+        pthread_mutex_lock(&read_queue_exit_count_semaphore);
 
-            /* printf("[TableWriterThread %d] Queue %c is empty. Finished " */
-            /*        "readers: %d\n", */
-            /*        my_data->thread_id, my_data->queue_letter, */
-            /*        *my_data->finished_reader_threads); */
+        if (*my_data->finished_reader_threads == NUMBER_OF_READER_THREADS) {
 
-            pthread_mutex_unlock(&file_queue_semaphores[index_by_alphabet(
-                my_data->queue_letter)]);
-
-            pthread_mutex_lock(&read_queue_exit_count_semaphore);
-            if (*my_data->finished_reader_threads == NUMBER_OF_READER_THREADS) {
-                /* printf("[TableWriterThread %d] No more data to process and
-                 * all " */
-                /*        "reader threads finished. Exiting.\n", */
-                /*        my_data->thread_id); */
-
-                pthread_mutex_unlock(&read_queue_exit_count_semaphore);
-                pthread_exit(NULL);
-            }
             pthread_mutex_unlock(&read_queue_exit_count_semaphore);
-
-            usleep(100000);
-            continue;
+            pthread_exit(NULL);
         }
 
-        /* printf( */
-        /*     "[TableWriterThread %d] Dequeued data from queue %c. Buffer:
-         * %s\n", */
-        /*     my_data->thread_id, my_data->queue_letter, (char *)buffer); */
+        pthread_mutex_unlock(&read_queue_exit_count_semaphore);
+
+        usleep(10000);
+        continue;
 
         pthread_mutex_unlock(
             &file_queue_semaphores[index_by_alphabet(my_data->queue_letter)]);
 
-        /* printf("[TableWriterThread %d] Released read queue semaphore for " */
-        /*        "queue %d - letter %c.\n", */
-        /*        my_data->thread_id, index_by_alphabet(my_data->queue_letter),
-         */
-        /*        my_data->queue_letter); */
-
-        char *station_name = strtok(buffer, ";");
+        char *station_name = strtok(buffer_start, ";");
 
         if (station_name == NULL) {
-            /* printf( */
-            /*     "[TableWriterThread %d] Malformed line, skipping. Buffer:
-             * %s\n", */
-            /*     my_data->thread_id, buffer); */
             continue;
         }
 
         char *temperature_str = strtok(NULL, "\n");
 
         if (temperature_str == NULL) {
-            /* printf( */
-            /*     "[TableWriterThread %d] Malformed line, skipping. Buffer:
-             * %s\n", */
-            /*     my_data->thread_id, buffer); */
             continue;
         }
         float temperature = atof(temperature_str);
 
         pthread_mutex_lock(
             &table_semaphores[index_by_alphabet(my_data->queue_letter)]);
-        /* printf("[TableWriterThread %d] Acquired table semaphore.\n", */
-        /*        my_data->thread_id); */
-
         Station *existing_station = ht_get(my_data->table, station_name);
 
         if (existing_station != NULL) {
-
-            /* printf("[TableWriterThread %d] Found station: %s.\n", */
-            /*        my_data->thread_id, existing_station->name); */
-
             existing_station->average_temp =
                 calculate_average(existing_station->count,
                                   existing_station->average_temp, temperature);
@@ -452,12 +412,6 @@ void *insert_data_into_table(void *arg) {
 
             continue;
         }
-
-        /* printf("[TableWriterThread %d] Didn't Found station: %s. Creating
-         * " */
-        /*        "new.\n", */
-        /*        my_data->thread_id, station_name); */
-
         Station *s = malloc(sizeof(Station));
         strncpy(s->name, station_name, sizeof(s->name) - 1);
         s->average_temp = calculate_average(0, 0.0, temperature);
@@ -466,9 +420,6 @@ void *insert_data_into_table(void *arg) {
         s->count = 1;
 
         ht_set(my_data->table, station_name, s);
-
-        /* printf("[TableWriterThread %d] Releasing table semaphore.\n", */
-        /*        my_data->thread_id); */
         pthread_mutex_unlock(
             &table_semaphores[index_by_alphabet(my_data->queue_letter)]);
     }
@@ -498,6 +449,10 @@ FILE *open_file(const char *filename) {
 
 int main(void) {
     FILE *file = open_file("measurements.txt");
+
+    size_t file_size = get_file_size(file);
+    printf("File size: %llu bytes\n", (u_int64_t)file_size);
+
     initialize_semaphores();
     initialize_queues();
     initialize_hash_tables();
@@ -509,13 +464,17 @@ int main(void) {
     int read_rc;
     int file_read_count = 0;
     int finished_reader_threads = 0;
+    int file_mmap_offset = 0;
 
     for (int i = 0; i < NUMBER_OF_READER_THREADS; i++) {
         reader_thread_data[i].file_read_count = &file_read_count;
-        reader_thread_data[i].thread_id = i;
-        reader_thread_data[i].file = file;
         reader_thread_data[i].finished_reader_threads =
             &finished_reader_threads;
+
+        reader_thread_data[i].thread_id = i;
+        reader_thread_data[i].file = file;
+        reader_thread_data[i].file_size = file_size;
+        reader_thread_data[i].file_mmap_offset = &file_mmap_offset;
 
         read_rc = pthread_create(&reader_threads[i], NULL, process_file_data,
                                  (void *)&reader_thread_data[i]);
